@@ -13,6 +13,20 @@ Windows x64 免安装的 openEuler 论坛待审核项监控工具。程序读取
 - 最小化到托盘、单实例运行、休眠恢复补查、可滚动日志、日志复制和导出。
 - 状态栏显示监控状态、检查结果、待审核数量、上次检查、上次成功和下次检查时间。
 
+## 界面预览
+
+### 待审核列表
+
+![待审核列表](docs/images/review-list.png)
+
+### 设置
+
+![设置](docs/images/settings.png)
+
+### 运行日志
+
+![运行日志](docs/images/logs.png)
+
 ## 使用
 
 1. 将发布目录放到当前用户有写入权限的位置，运行 `openEulerReviewMonitor.exe`，无需安装 .NET。

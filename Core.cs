@@ -67,7 +67,7 @@ public sealed class RobotSettings
     public string Secret { get; set; } = "";
 }
 
-public sealed record ReviewItem(long Id, string Type, string Title, string Author, DateTimeOffset? CreatedAt)
+public sealed record ReviewItem(long Id, string Type, string Title, string Author, DateTimeOffset? CreatedAt, DateTimeOffset? PostCreatedAt = null)
 {
     public string CreatedText => CreatedAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "—";
 }
@@ -117,10 +117,30 @@ public static class ReviewParser
                 _ => type
             };
             DateTimeOffset? created = DateTimeOffset.TryParse(Text(row, "created_at"), out var date) ? date : null;
-            items.Add(new(id, label, WebUtility.HtmlDecode(title), authorName, created));
+            DateTimeOffset? postCreated = DateTimeOffset.TryParse(Text(row, "target_created_at"), out var targetDate) ? targetDate : null;
+            items.Add(new(id, label, WebUtility.HtmlDecode(title), authorName, created, postCreated));
         }
         var meta = Object(root, "meta");
         return new(items, Text(meta, "load_more_reviewables"), (int?)Number(meta, "total_rows_reviewables"));
+    }
+
+    public static Dictionary<long, DateTimeOffset> ParseCompletionTimes(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("reviewables", out var rows) || rows.ValueKind != JsonValueKind.Array)
+            throw new InvalidOperationException("审核历史响应缺少审核列表。");
+        var result = new Dictionary<long, DateTimeOffset>();
+        foreach (var row in rows.EnumerateArray())
+        {
+            if (Number(row, "id") is not long id || string.Equals(Text(row, "status"), "pending", StringComparison.OrdinalIgnoreCase)) continue;
+            var dates = new List<DateTimeOffset>();
+            foreach (var score in Array(row, "reviewable_scores"))
+                if (Date(score, "reviewed_at") is DateTimeOffset reviewed) dates.Add(reviewed);
+            foreach (var history in Array(row, "reviewable_histories"))
+                if (!string.Equals(Text(history, "status"), "pending", StringComparison.OrdinalIgnoreCase) && Date(history, "created_at") is DateTimeOffset transitioned) dates.Add(transitioned);
+            if (dates.Count > 0) result[id] = dates.Max();
+        }
+        return result;
     }
 
     private static Dictionary<long, JsonElement> Map(JsonElement root, string key)
@@ -130,8 +150,14 @@ public static class ReviewParser
             foreach (var value in list.EnumerateArray()) if (Number(value, "id") is long id) result[id] = value;
         return result;
     }
+    private static IEnumerable<JsonElement> Array(JsonElement value, string key)
+    {
+        var child = Object(value, key);
+        return child.ValueKind == JsonValueKind.Array ? child.EnumerateArray() : Enumerable.Empty<JsonElement>();
+    }
     public static JsonElement Object(JsonElement value, string key) => value.ValueKind == JsonValueKind.Object && value.TryGetProperty(key, out var child) ? child : default;
     public static string? Text(JsonElement value, string key) { var child = Object(value, key); return child.ValueKind == JsonValueKind.String ? child.GetString() : null; }
+    private static DateTimeOffset? Date(JsonElement value, string key) => DateTimeOffset.TryParse(Text(value, key), out var date) ? date : null;
     public static long? Number(JsonElement value, string key)
     {
         var child = Object(value, key);
@@ -158,20 +184,7 @@ public sealed class ForumClient : IDisposable
             if (next.Scheme != settings.BaseUri.Scheme || next.Authority != settings.BaseUri.Authority)
                 throw new InvalidOperationException("审核分页跳到了其他站点，已拒绝发送认证信息。");
             if (!visited.Add(next.AbsoluteUri) || visited.Count > 1000) throw new InvalidOperationException("审核分页异常，本次结果未更新。");
-            using var request = new HttpRequestMessage(HttpMethod.Get, next);
-            request.Headers.Accept.ParseAdd("application/json");
-            request.Headers.UserAgent.ParseAdd("openEulerReviewMonitor/1.0");
-            if (settings.AuthMode == "Cookie")
-            {
-                string cookie = settings.Cookie.Trim();
-                if (cookie.StartsWith("Cookie:", StringComparison.OrdinalIgnoreCase)) cookie = cookie[7..].Trim();
-                request.Headers.Add("Cookie", cookie);
-            }
-            else
-            {
-                request.Headers.Add("Api-Key", settings.ApiKey.Trim());
-                if (!string.IsNullOrWhiteSpace(settings.ApiUsername)) request.Headers.Add("Api-Username", settings.ApiUsername.Trim());
-            }
+            using var request = CreateRequest(settings, next);
             using var response = await client.SendAsync(request, ct);
             if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) throw new AuthenticationException($"论坛返回 HTTP {(int)response.StatusCode}（未认证或访问被拒绝）。");
             if ((int)response.StatusCode is >= 300 and < 400) throw new AuthenticationException($"论坛返回 HTTP {(int)response.StatusCode} 重定向，未获得审核列表。");
@@ -195,7 +208,96 @@ public sealed class ForumClient : IDisposable
         }
         return all.Values.OrderByDescending(x => x.Id).ToList();
     }
+    public async Task<Dictionary<long, DateTimeOffset>> FetchCompletionTimesAsync(Settings settings, IEnumerable<long> ids, CancellationToken ct)
+    {
+        var requested = ids.Distinct().ToArray();
+        if (requested.Length == 0) return new();
+        var result = new Dictionary<long, DateTimeOffset>();
+        foreach (var batch in requested.Chunk(50))
+        {
+            string query = "review.json?status=all&" + string.Join("&", batch.Select(id => "ids[]=" + id));
+            using var request = CreateRequest(settings, new Uri(settings.BaseUri, query));
+            using var response = await client.SendAsync(request, ct);
+            if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"读取审核历史失败（HTTP {(int)response.StatusCode}）。");
+            string body = await response.Content.ReadAsStringAsync(ct);
+            foreach (var (id, completedAt) in ReviewParser.ParseCompletionTimes(body)) result[id] = completedAt;
+        }
+        return result;
+    }
+    private static HttpRequestMessage CreateRequest(Settings settings, Uri uri)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.Accept.ParseAdd("application/json");
+        request.Headers.UserAgent.ParseAdd("openEulerReviewMonitor/1.0");
+        if (settings.AuthMode == "Cookie")
+        {
+            string cookie = settings.Cookie.Trim();
+            if (cookie.StartsWith("Cookie:", StringComparison.OrdinalIgnoreCase)) cookie = cookie[7..].Trim();
+            request.Headers.Add("Cookie", cookie);
+        }
+        else
+        {
+            request.Headers.Add("Api-Key", settings.ApiKey.Trim());
+            if (!string.IsNullOrWhiteSpace(settings.ApiUsername)) request.Headers.Add("Api-Username", settings.ApiUsername.Trim());
+        }
+        return request;
+    }
     public void Dispose() => client.Dispose();
+}
+
+public sealed class ReviewStatsRecord
+{
+    public long Id { get; set; }
+    public string Type { get; set; } = "";
+    public string Title { get; set; } = "";
+    public string Author { get; set; } = "";
+    public DateTimeOffset? PostCreatedAt { get; set; }
+    public DateTimeOffset? ReviewQueuedAt { get; set; }
+    public DateTimeOffset FirstSeen { get; set; }
+    public DateTimeOffset? CompletedAt { get; set; } // 首次观察到已完成的时间
+    public DateTimeOffset? ServerCompletedAt { get; set; }
+    public DateTimeOffset? EffectiveCompletedAt => ServerCompletedAt ?? CompletedAt;
+    public TimeSpan? Duration => EffectiveCompletedAt is DateTimeOffset done ? done - (PostCreatedAt ?? ReviewQueuedAt ?? FirstSeen) : null;
+    public string PostCreatedText => PostCreatedAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "—";
+    public string QueuedText => ReviewQueuedAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "—";
+    public string DetectedText => FirstSeen.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
+    public string CompletedText => EffectiveCompletedAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "—";
+    public string CompletionSourceText => ServerCompletedAt != null ? "服务端" : CompletedAt != null ? "本地观察" : "—";
+    public string DurationText => Duration is TimeSpan span ? FormatDuration(span) : "—";
+    public static string FormatDuration(TimeSpan span)
+    {
+        if (span < TimeSpan.Zero) span = TimeSpan.Zero;
+        if (span.TotalMinutes < 1) return $"{(int)span.TotalSeconds} 秒";
+        if (span.TotalHours < 1) return $"{(int)span.TotalMinutes} 分钟";
+        if (span.TotalDays < 1) return $"{(int)span.TotalHours} 小时 {(int)span.TotalMinutes % 60} 分";
+        return $"{(int)span.TotalDays} 天 {(int)span.TotalHours % 24} 小时";
+    }
+}
+
+public sealed class ReviewStats
+{
+    public List<ReviewStatsRecord> Records { get; set; } = new();
+    public List<ReviewStatsRecord> Apply(List<ReviewItem> current, DateTimeOffset now)
+    {
+        var newlyCompleted = new List<ReviewStatsRecord>();
+        var map = Records.GroupBy(x => x.Id).ToDictionary(g => g.Key, g => g.First());
+        var currentIds = new HashSet<long>();
+        foreach (var item in current)
+        {
+            currentIds.Add(item.Id);
+            if (map.TryGetValue(item.Id, out var record))
+            {
+                record.Type = item.Type; record.Title = item.Title; record.Author = item.Author;
+                record.ReviewQueuedAt ??= item.CreatedAt;
+                record.PostCreatedAt ??= item.PostCreatedAt;
+                if (record.CompletedAt != null) { record.CompletedAt = null; record.ServerCompletedAt = null; } // 审核项被重新打开
+            }
+            else Records.Add(new() { Id = item.Id, Type = item.Type, Title = item.Title, Author = item.Author, ReviewQueuedAt = item.CreatedAt, PostCreatedAt = item.PostCreatedAt, FirstSeen = now });
+        }
+        foreach (var record in Records)
+            if (!currentIds.Contains(record.Id) && record.CompletedAt == null) { record.CompletedAt = now; newlyCompleted.Add(record); }
+        return newlyCompleted;
+    }
 }
 
 public sealed class DeliveryState
@@ -220,4 +322,3 @@ public sealed class DeliveryState
         foreach (var delivered in Delivered.Values) delivered.IntersectWith(ids);
     }
 }
-

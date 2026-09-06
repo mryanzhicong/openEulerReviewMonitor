@@ -22,6 +22,7 @@ namespace ForumReviewMonitor;
 public partial class MainWindow : Window
 {
     private List<ReviewItem> reviewItems = new();
+    private ReviewStats stats = new();
     private int reviewPage;
     private Settings settings;
     private readonly AppLog log = new();
@@ -43,9 +44,11 @@ public partial class MainWindow : Window
         InitializeComponent();
         Height = Math.Min(Height, Math.Max(MinHeight, SystemParameters.WorkArea.Height * 0.85));
         settings = Storage.LoadSettings();
+        stats = Storage.LoadStats(settings);
         LoadControls();
         UpdateEnabledChannels();
         RefreshReviewPage();
+        RefreshStatsPage();
         using (var stream = Application.GetResourceStream(new Uri("pack://application:,,,/openEulerReviewMonitor;component/Assets/openeuler.ico")).Stream)
         using (var icon = new System.Drawing.Icon(stream)) trayIcon = (System.Drawing.Icon)icon.Clone();
         tray = new Forms.NotifyIcon { Text = "openEuler 论坛审核助手 · 已停止", Icon = trayIcon, Visible = !headless };
@@ -158,6 +161,7 @@ public partial class MainWindow : Window
         if (settings.ForumUrl != value.ForumUrl || settings.AuthMode != value.AuthMode || settings.Cookie != value.Cookie || settings.ApiKey != value.ApiKey || settings.ApiUsername != value.ApiUsername)
         {
             reviewItems.Clear(); reviewPage = 0; RefreshReviewPage(); CountText.Text = "待审核：—"; lastSuccess = null; lastAttempt = null; resultStatus = "";
+            stats = Storage.LoadStats(value); RefreshStatsPage();
         }
         settings = value;
         UpdateEnabledChannels();
@@ -269,6 +273,20 @@ public partial class MainWindow : Window
             lastSuccess = DateTimeOffset.Now; authAlerted = false; resultStatus = "成功";
             reviewItems = items; RefreshReviewPage();
             CountText.Text = $"待审核：{items.Count}";
+            var newlyCompleted = stats.Apply(items, DateTimeOffset.Now);
+            if (newlyCompleted.Count > 0)
+            {
+                try
+                {
+                    var completionTimes = await forum.FetchCompletionTimesAsync(settings, newlyCompleted.Select(x => x.Id), operation.Token);
+                    foreach (var record in newlyCompleted)
+                        if (completionTimes.TryGetValue(record.Id, out var completedAt)) record.ServerCompletedAt = completedAt;
+                }
+                catch (OperationCanceledException) when (operation.IsCancellationRequested) { throw; }
+                catch (Exception ex) { log.Write("WARN", "未读取到服务端审核完成时间，已保留本地观察时间。" + SafeError(ex)); }
+            }
+            Storage.SaveStats(settings, stats);
+            RefreshStatsPage();
             state.Prune(items);
             Storage.SaveState(settings, state);
             log.Write("INFO", $"检查成功，当前待处理 {items.Count} 项。");
@@ -532,6 +550,66 @@ public partial class MainWindow : Window
         };
         RefreshReviewPage();
     }
+    private void RefreshStatsPage()
+    {
+        if (StatsGrid == null || DistributionPanel == null) return;
+        var pending = stats.Records.Where(r => r.CompletedAt == null).OrderByDescending(r => r.FirstSeen).ToList();
+        var completed = stats.Records.Where(r => r.CompletedAt != null).OrderByDescending(r => r.CompletedAt).ToList();
+        StatsTotalText.Text = stats.Records.Count.ToString();
+        StatsCompletedText.Text = completed.Count.ToString();
+        StatsPendingText.Text = pending.Count.ToString();
+        var durations = completed.Select(r => r.Duration).Where(d => d.HasValue).Select(d => d!.Value).OrderBy(d => d).ToList();
+        StatsAvgText.Text = durations.Count > 0 ? ReviewStatsRecord.FormatDuration(TimeSpan.FromTicks((long)durations.Average(d => d.Ticks))) : "—";
+        StatsMedianText.Text = durations.Count > 0 ? ReviewStatsRecord.FormatDuration(durations.Count % 2 == 0 ? TimeSpan.FromTicks((durations[durations.Count / 2 - 1].Ticks + durations[durations.Count / 2].Ticks) / 2) : durations[durations.Count / 2]) : "—";
+        DateTimeOffset now = DateTimeOffset.Now;
+        StatsLongestText.Text = pending.Count > 0 ? ReviewStatsRecord.FormatDuration(now - pending.Min(r => r.PostCreatedAt ?? r.ReviewQueuedAt ?? r.FirstSeen)) : "—";
+        RenderDistribution(durations);
+        StatsGrid.ItemsSource = pending.Concat(completed).ToList();
+    }
+    private void RenderDistribution(List<TimeSpan> durations)
+    {
+        DistributionPanel.Children.Clear();
+        if (durations.Count == 0)
+        {
+            DistributionPanel.Children.Add(new TextBlock { Text = "暂无已完成记录，审核完成后将在此显示分布。", Foreground = Brushes.SlateGray });
+            return;
+        }
+        int[] counts =
+        {
+            durations.Count(d => d.TotalHours < 1),
+            durations.Count(d => d.TotalHours >= 1 && d.TotalHours < 4),
+            durations.Count(d => d.TotalHours >= 4 && d.TotalHours < 24),
+            durations.Count(d => d.TotalHours >= 24 && d.TotalHours < 72),
+            durations.Count(d => d.TotalHours >= 72)
+        };
+        string[] labels = { "< 1 小时", "1–4 小时", "4–24 小时", "1–3 天", "≥ 3 天" };
+        int max = counts.Max();
+        for (int i = 0; i < labels.Length; i++)
+        {
+            var row = new Grid { Margin = new Thickness(0, i > 0 ? 4 : 0, 0, 0) };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(72) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(360) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.Children.Add(new TextBlock { Text = labels[i], VerticalAlignment = VerticalAlignment.Center, Foreground = Brushes.SlateGray });
+            var track = new Grid { Margin = new Thickness(8,0,12,0) }; Grid.SetColumn(track, 1);
+            track.Children.Add(new Border { Background = (Brush)new BrushConverter().ConvertFromString("#E8EDF5")!, Height = 14, CornerRadius = new CornerRadius(2) });
+            if (counts[i] > 0)
+                track.Children.Add(new Border
+                {
+                    Background = (Brush)new BrushConverter().ConvertFromString("#2563EB")!,
+                    Height = 14, Width = Math.Max(3, 360.0 * counts[i] / max),
+                    CornerRadius = new CornerRadius(2), HorizontalAlignment = HorizontalAlignment.Left
+                });
+            row.Children.Add(track);
+            row.Children.Add(new TextBlock
+            {
+                Text = $"{counts[i]}（{counts[i] * 100.0 / durations.Count:0.#}%）",
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            Grid.SetColumn(row.Children[^1], 2);
+            DistributionPanel.Children.Add(row);
+        }
+    }
     private void ContentSizeChanged(object sender, SizeChangedEventArgs e)
     {
         if (ReviewGrid != null && ReviewGrid.Columns.Count > 2 && ReviewGrid.ActualWidth > 0)
@@ -571,6 +649,22 @@ public partial class MainWindow : Window
             MessageBox.Show(this, "日志已导出（保留最近 30 天）。");
         }
         catch { MessageBox.Show(this, "导出失败，请检查目标目录权限。"); }
+    }
+    private void ExportStatsClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new SaveFileDialog { FileName = $"openEuler-审核统计-{DateTime.Now:yyyyMMdd-HHmmss}.csv", Filter = "CSV 文件|*.csv" };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            static string Csv(string? value) => "\"" + (value ?? "").Replace("\"", "\"\"") + "\"";
+            var rows = stats.Records.OrderBy(r => r.CompletedAt != null).ThenByDescending(r => r.EffectiveCompletedAt ?? r.FirstSeen);
+            var csv = new StringBuilder("ID,类型,标题,作者,发帖时间,进入审核列表时间,检测到时间,处理完成时间,完成时间来源,耗时\r\n");
+            foreach (var r in rows)
+                csv.AppendJoin(',', Csv(r.Id.ToString()), Csv(r.Type), Csv(r.Title), Csv(r.Author), Csv(r.PostCreatedText), Csv(r.QueuedText), Csv(r.DetectedText), Csv(r.CompletedText), Csv(r.CompletionSourceText), Csv(r.DurationText)).Append("\r\n");
+            File.WriteAllText(dialog.FileName, csv.ToString(), new UTF8Encoding(true));
+            MessageBox.Show(this, $"已导出 {stats.Records.Count} 条统计记录。", "导出统计");
+        }
+        catch { MessageBox.Show(this, "导出失败，请检查目标目录权限。", "导出统计"); }
     }
     public void RestoreWindow() { Show(); if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal; Activate(); }
     private void OnClosing(object? sender, CancelEventArgs e)

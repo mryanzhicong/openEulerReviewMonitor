@@ -108,6 +108,23 @@ internal static class Program
             Check(((ReviewItem)reviewGrid.Items[0]).Id == 21 && reviewGrid.Items.Count == 5 && !Get<Button>("ReviewLast").IsEnabled, "last button jumps to final partial page");
             Call("ReviewPageClick", Get<Button>("ReviewFirst"));
             Check(((ReviewItem)reviewGrid.Items[0]).Id == 1 && reviewGrid.Items.Count == 10 && !Get<Button>("ReviewFirst").IsEnabled, "first button returns to first page");
+            bool FirstCellCentered(DataGrid grid)
+            {
+                content.UpdateLayout();
+                var row = (DataGridRow)grid.ItemContainerGenerator.ContainerFromIndex(0)!;
+                var cell = Find<DataGridCell>(row)!;
+                var label = Find<TextBlock>(cell)!;
+                double top = label.TranslatePoint(new Point(), cell).Y;
+                double bottom = cell.ActualHeight - top - label.ActualHeight;
+                return Math.Abs(top - bottom) < 2;
+            }
+            Check(FirstCellCentered(reviewGrid), "review list text is vertically centered in its row");
+            var sampleStats = new ReviewStats { Records = [new() { Id = 99, Type = "待审主题", Title = "示例", Author = "测试", FirstSeen = DateTimeOffset.Now }] };
+            typeof(MainWindow).GetField("stats", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, sampleStats);
+            typeof(MainWindow).GetMethod("RefreshStatsPage", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(window, null);
+            tabs.SelectedIndex = 1; content.UpdateLayout();
+            Check(FirstCellCentered(Get<DataGrid>("StatsGrid")), "statistics text is vertically centered in its row");
+            tabs.SelectedIndex = 0;
             var testLog = (AppLog)typeof(MainWindow).GetField("log", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
             testLog.Write("INFO", "fixture-search info"); testLog.Write("ERROR", "fixture-search error");
             var logBox = Get<TextBox>("LogTextBox");
@@ -118,7 +135,7 @@ internal static class Program
             Get<CheckBox>("AutoScrollLogs").IsChecked = true;
             Get<ComboBox>("AuthBox").SelectedIndex = 1;
             channels.SelectedIndex = 2;
-            foreach (int index in new[] { 0, 1, 2 })
+            foreach (int index in new[] { 0, 1, 2, 3 })
             {
                 tabs.SelectedIndex = index;
                 content.Measure(new Size(1100, 620)); content.Arrange(new Rect(0, 0, 1100, 620)); content.UpdateLayout();
@@ -126,8 +143,8 @@ internal static class Program
                 var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
                 using var stream = File.Create(Path.Combine(output, $"tab-{index}.png")); encoder.Save(stream);
             }
-            tabs.SelectedIndex = 1;
-            Check(tabs.Items.Count == 3, "three main tabs");
+            tabs.SelectedIndex = 2;
+            Check(tabs.Items.Count == 4, "four main tabs");
             double[]? stablePositions = null;
             double[] Positions() => new[] {
                 Get<Button>("TestButton").TranslatePoint(new Point(), content).Y,

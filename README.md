@@ -2,7 +2,7 @@
 
 Windows x64 免安装的 openEuler 论坛待审核项监控工具。程序读取待审核列表，发现新增项时通过 Windows 通知和可选的群机器人渠道提醒；实际审核在浏览器中完成。
 
-当前版本：v1.7.0
+当前版本：v1.7.1
 
 ## 功能
 
@@ -34,7 +34,7 @@ Windows x64 免安装的 openEuler 论坛待审核项监控工具。程序读取
 
 ## 使用
 
-1. 将发布目录放到当前用户有写入权限的位置，运行 `openEulerReviewMonitor.exe`，无需安装 .NET。
+1. 将发布目录放到当前用户有写入权限的位置，运行 `openEulerReviewMonitor-v1.7.1-win-x64.exe`，无需安装 .NET。
 2. 在“设置”中填写论坛地址，并选择 Cookie 或 API Key。Cookie 必须填写完整的 `名称=值`，不要填写网页 URL、`Set-Cookie` 响应头或只有值的片段。
 3. 点击“验证认证”。结果仅显示在页面中，不保存设置，也不会发送推送。
 4. 需要时选择企业微信、钉钉或飞书，填写 Webhook 后启用并保存当前渠道。Windows 通知仍会同步保留。
@@ -73,9 +73,15 @@ dotnet run --project Tests/Tests.csproj -c Release
 ./publish.ps1
 ```
 
-发布产物位于 `dist/win-x64`。项目使用 `Microsoft.Data.Sqlite` 管理本地统计与去重数据；自动化测试使用模拟 HTTP 响应，不访问真实论坛或发送群消息。
+发布产物位于 `dist/win-x64/openEulerReviewMonitor-v1.7.1-win-x64.exe`。项目使用 `Microsoft.Data.Sqlite` 管理本地统计与去重数据；自动化测试使用模拟 HTTP 响应，不访问真实论坛或发送群消息。
 
 ## 版本历史
+
+### v1.7.1
+
+- 从审核项详情读取服务端状态变更时间，并在后续检查时补全旧记录的处理完成时间。
+- 待审核列表和统计表格的文字上下居中。
+- 审核耗时分布改为两列四档：6 小时内、6–24 小时、1–3 天、3 天及以上。
 
 ### v1.7.0
 

@@ -58,8 +58,10 @@ var first = statsData.Records.Single(r => r.Id == 1);
 Assert(first.CompletedAt == t0.AddMinutes(45) && first.Duration == TimeSpan.FromMinutes(75), "duration measures post creation to completion");
 statsData = JsonSerializer.Deserialize<ReviewStats>(JsonSerializer.Serialize(statsData))!;
 Assert(statsData.Records.Count == 2 && statsData.Records.Single(r => r.Id == 1).Duration == TimeSpan.FromMinutes(75), "stats survive restart");
-var completions = ReviewParser.ParseCompletionTimes("""{"reviewables":[{"id":1,"status":1,"reviewable_scores":[{"reviewed_at":"2026-09-05T02:00:00Z"},{"reviewed_at":"2026-09-05T02:05:00Z"}]}]}""");
-Assert(completions[1] == DateTimeOffset.Parse("2026-09-05T02:05:00Z"), "latest server completion time is retained");
+var completion = ReviewParser.ParseCompletionTime("""{"reviewable":{"id":1,"status":2,"reviewable_history_ids":[7,8]},"reviewable_histories":[{"id":7,"reviewable_history_type":0,"status":0,"created_at":"2026-09-05T01:00:00Z"},{"id":8,"reviewable_history_type":1,"status":2,"created_at":"2026-09-05T02:00:00Z"}],"reviewable_scores":[{"reviewed_at":"2026-09-05T02:05:00Z"}]}""", 1);
+Assert(completion == DateTimeOffset.Parse("2026-09-05T02:00:00Z"), "server status transition is preferred over score timestamps");
+Assert(ReviewParser.ParseCompletionTime("""{"reviewable":{"id":2,"status":1},"reviewable_scores":[{"reviewed_at":"2026-09-05T03:00:00Z"}]}""", 2) == DateTimeOffset.Parse("2026-09-05T03:00:00Z"), "score timestamp is fallback when history is absent");
+Assert(ReviewParser.ParseCompletionTime("""{"reviewable":{"id":3,"status":0},"reviewable_histories":[{"reviewable_history_type":1,"status":1,"created_at":"2026-09-05T03:00:00Z"}]}""", 3) == null, "pending item has no completion time");
 
 var databaseSettings = new Settings { ForumUrl = "https://stats-test.example/" };
 var databaseStats = new ReviewStats { Records = [new() { Id = 99, Type = "待审主题", Title = "SQLite 记录", Author = "tester", FirstSeen = t0, ReviewQueuedAt = t0.AddMinutes(-5), CompletedAt = t0, ServerCompletedAt = t0.AddMinutes(-1) }] };
@@ -94,8 +96,9 @@ using (var client = new ForumClient(new FakeHandler(_ => Reply("""{"reviewables"
     await Throws<InvalidOperationException>(() => client.FetchAsync(settings, default), "cross origin pagination cannot leak cookie");
 using (var client = new ForumClient(new FakeHandler(request =>
 {
-    Assert(request.RequestUri!.Query.Contains("status=all") && request.RequestUri.Query.Contains("ids[]=10") && request.RequestUri.Query.Contains("ids[]=11"), "completion history queries requested IDs");
-    return Reply("""{"reviewables":[{"id":10,"status":1,"reviewable_scores":[{"reviewed_at":"2026-09-05T02:00:00Z"}]},{"id":11,"status":2,"reviewable_scores":[{"reviewed_at":"2026-09-05T03:00:00Z"}]}]}""");
+    var id = long.Parse(request.RequestUri!.Segments[^1].Replace(".json", ""));
+    Assert(id is 10 or 11, "completion details query requested IDs");
+    return Reply($$"""{"reviewable":{"id":{{id}},"status":2},"reviewable_histories":[{"reviewable_history_type":1,"status":2,"created_at":"2026-09-05T0{{id - 8}}:00:00Z"}]}""");
 })))
 {
     var completionTimes = await client.FetchCompletionTimesAsync(settings, [10, 11], default);

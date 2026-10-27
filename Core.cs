@@ -124,23 +124,26 @@ public static class ReviewParser
         return new(items, Text(meta, "load_more_reviewables"), (int?)Number(meta, "total_rows_reviewables"));
     }
 
-    public static Dictionary<long, DateTimeOffset> ParseCompletionTimes(string json)
+    public static DateTimeOffset? ParseCompletionTime(string json, long expectedId)
     {
         using var doc = JsonDocument.Parse(json);
-        if (!doc.RootElement.TryGetProperty("reviewables", out var rows) || rows.ValueKind != JsonValueKind.Array)
-            throw new InvalidOperationException("审核历史响应缺少审核列表。");
-        var result = new Dictionary<long, DateTimeOffset>();
-        foreach (var row in rows.EnumerateArray())
-        {
-            if (Number(row, "id") is not long id || string.Equals(Text(row, "status"), "pending", StringComparison.OrdinalIgnoreCase)) continue;
-            var dates = new List<DateTimeOffset>();
-            foreach (var score in Array(row, "reviewable_scores"))
-                if (Date(score, "reviewed_at") is DateTimeOffset reviewed) dates.Add(reviewed);
-            foreach (var history in Array(row, "reviewable_histories"))
-                if (!string.Equals(Text(history, "status"), "pending", StringComparison.OrdinalIgnoreCase) && Date(history, "created_at") is DateTimeOffset transitioned) dates.Add(transitioned);
-            if (dates.Count > 0) result[id] = dates.Max();
-        }
-        return result;
+        var root = doc.RootElement;
+        var reviewable = Object(root, "reviewable");
+        if (Number(reviewable, "id") != expectedId)
+            throw new InvalidOperationException("审核详情响应缺少对应审核项。");
+        if (Number(reviewable, "status") == 0 || string.Equals(Text(reviewable, "status"), "pending", StringComparison.OrdinalIgnoreCase)) return null;
+
+        // Discourse side-loads histories and scores at the response root, not inside reviewable.
+        var transitions = Array(root, "reviewable_histories")
+            .Where(history => Number(history, "reviewable_history_type") == 1 && Number(history, "status") != 0)
+            .Select(history => Date(history, "created_at"))
+            .Where(date => date.HasValue).Select(date => date!.Value).ToList();
+        if (transitions.Count > 0) return transitions.Max();
+
+        var reviewed = Array(root, "reviewable_scores")
+            .Select(score => Date(score, "reviewed_at"))
+            .Where(date => date.HasValue).Select(date => date!.Value).ToList();
+        return reviewed.Count > 0 ? reviewed.Max() : null;
     }
 
     private static Dictionary<long, JsonElement> Map(JsonElement root, string key)
@@ -210,17 +213,14 @@ public sealed class ForumClient : IDisposable
     }
     public async Task<Dictionary<long, DateTimeOffset>> FetchCompletionTimesAsync(Settings settings, IEnumerable<long> ids, CancellationToken ct)
     {
-        var requested = ids.Distinct().ToArray();
-        if (requested.Length == 0) return new();
         var result = new Dictionary<long, DateTimeOffset>();
-        foreach (var batch in requested.Chunk(50))
+        foreach (var id in ids.Distinct())
         {
-            string query = "review.json?status=all&" + string.Join("&", batch.Select(id => "ids[]=" + id));
-            using var request = CreateRequest(settings, new Uri(settings.BaseUri, query));
+            using var request = CreateRequest(settings, new Uri(settings.BaseUri, $"review/{id}.json"));
             using var response = await client.SendAsync(request, ct);
-            if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"读取审核历史失败（HTTP {(int)response.StatusCode}）。");
+            if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"读取审核项 #{id} 的详情失败（HTTP {(int)response.StatusCode}）。");
             string body = await response.Content.ReadAsStringAsync(ct);
-            foreach (var (id, completedAt) in ReviewParser.ParseCompletionTimes(body)) result[id] = completedAt;
+            if (ReviewParser.ParseCompletionTime(body, id) is DateTimeOffset completedAt) result[id] = completedAt;
         }
         return result;
     }

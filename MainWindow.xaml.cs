@@ -273,13 +273,14 @@ public partial class MainWindow : Window
             lastSuccess = DateTimeOffset.Now; authAlerted = false; resultStatus = "成功";
             reviewItems = items; RefreshReviewPage();
             CountText.Text = $"待审核：{items.Count}";
-            var newlyCompleted = stats.Apply(items, DateTimeOffset.Now);
-            if (newlyCompleted.Count > 0)
+            stats.Apply(items, DateTimeOffset.Now);
+            var missingServerTime = stats.Records.Where(record => record.CompletedAt != null && record.ServerCompletedAt == null).ToList();
+            if (missingServerTime.Count > 0)
             {
                 try
                 {
-                    var completionTimes = await forum.FetchCompletionTimesAsync(settings, newlyCompleted.Select(x => x.Id), operation.Token);
-                    foreach (var record in newlyCompleted)
+                    var completionTimes = await forum.FetchCompletionTimesAsync(settings, missingServerTime.Select(x => x.Id), operation.Token);
+                    foreach (var record in missingServerTime)
                         if (completionTimes.TryGetValue(record.Id, out var completedAt)) record.ServerCompletedAt = completedAt;
                 }
                 catch (OperationCanceledException) when (operation.IsCancellationRequested) { throw; }
@@ -569,6 +570,7 @@ public partial class MainWindow : Window
     private void RenderDistribution(List<TimeSpan> durations)
     {
         DistributionPanel.Children.Clear();
+        DistributionPanel.Columns = durations.Count == 0 ? 1 : 2;
         if (durations.Count == 0)
         {
             DistributionPanel.Children.Add(new TextBlock { Text = "暂无已完成记录，审核完成后将在此显示分布。", Foreground = Brushes.SlateGray });
@@ -576,31 +578,31 @@ public partial class MainWindow : Window
         }
         int[] counts =
         {
-            durations.Count(d => d.TotalHours < 1),
-            durations.Count(d => d.TotalHours >= 1 && d.TotalHours < 4),
-            durations.Count(d => d.TotalHours >= 4 && d.TotalHours < 24),
+            durations.Count(d => d.TotalHours < 6),
+            durations.Count(d => d.TotalHours >= 6 && d.TotalHours < 24),
             durations.Count(d => d.TotalHours >= 24 && d.TotalHours < 72),
             durations.Count(d => d.TotalHours >= 72)
         };
-        string[] labels = { "< 1 小时", "1–4 小时", "4–24 小时", "1–3 天", "≥ 3 天" };
+        string[] labels = { "< 6 小时", "6–24 小时", "1–3 天", "≥ 3 天" };
         int max = counts.Max();
-        for (int i = 0; i < labels.Length; i++)
+        // Fill rows left to right while each column reads from shorter to longer durations.
+        foreach (int i in new[] { 0, 2, 1, 3 })
         {
-            var row = new Grid { Margin = new Thickness(0, i > 0 ? 4 : 0, 0, 0) };
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(72) });
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(360) });
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var row = new Grid { Margin = new Thickness(i < 2 ? 0 : 16, 0, 4, 4) };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(78) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(80) });
             row.Children.Add(new TextBlock { Text = labels[i], VerticalAlignment = VerticalAlignment.Center, Foreground = Brushes.SlateGray });
-            var track = new Grid { Margin = new Thickness(8,0,12,0) }; Grid.SetColumn(track, 1);
-            track.Children.Add(new Border { Background = (Brush)new BrushConverter().ConvertFromString("#E8EDF5")!, Height = 14, CornerRadius = new CornerRadius(2) });
-            if (counts[i] > 0)
-                track.Children.Add(new Border
-                {
-                    Background = (Brush)new BrushConverter().ConvertFromString("#2563EB")!,
-                    Height = 14, Width = Math.Max(3, 360.0 * counts[i] / max),
-                    CornerRadius = new CornerRadius(2), HorizontalAlignment = HorizontalAlignment.Left
-                });
-            row.Children.Add(track);
+            var bar = new ProgressBar
+            {
+                Minimum = 0, Maximum = max, Value = counts[i], Height = 14,
+                Margin = new Thickness(8, 0, 12, 0), VerticalAlignment = VerticalAlignment.Center,
+                Background = (Brush)new BrushConverter().ConvertFromString("#E8EDF5")!,
+                Foreground = (Brush)new BrushConverter().ConvertFromString("#2563EB")!,
+                BorderThickness = new Thickness(0)
+            };
+            Grid.SetColumn(bar, 1);
+            row.Children.Add(bar);
             row.Children.Add(new TextBlock
             {
                 Text = $"{counts[i]}（{counts[i] * 100.0 / durations.Count:0.#}%）",
